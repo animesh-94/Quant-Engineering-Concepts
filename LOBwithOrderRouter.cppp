@@ -1,0 +1,312 @@
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <string>
+#include <map>
+#include <list>
+#include <iomanip>
+#include <unordered_map>
+#include <deque>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <atomic>
+#include <memory>
+
+// ==========================================
+// 1. THE ENGINE: OrderBook with MM Strategy
+// ==========================================
+class OrderBook {
+public:
+    enum class OrderType { Market, Limit, GTC, FOK };
+    enum class Side { Buy, Sell };
+
+    class Order {
+    public:
+        Order(int id, OrderType type, Side side, double price, int quantity)
+            : id(id), type(type), side(side), price(price), quantity(quantity) {}
+        int getId() const { return id; }
+        OrderType getType() const { return type; }
+        Side getSide() const { return side; }
+        double getPrice() const { return price; }
+        int getQuantity() const { return quantity; }
+        void setQuantity(int q) { quantity = q; }
+    private:
+        int id; OrderType type; Side side; double price; int quantity;
+    };
+
+    struct Trade {
+        long long timestamp;
+        int takerId, makerId;
+        double price; int quantity;
+        Side takerSide;
+    };
+
+    struct Quote { double price; int quantity; };
+
+    // --- MARKET METRICS ---
+
+    double getMidPrice() const {
+        std::lock_guard<std::mutex> lock(bookMutex);
+        if (Bids.empty() || Asks.empty()) return 0.0;
+        return (Bids.begin()->first + Asks.begin()->first) / 2.0;
+    }
+
+    double getImbalance() const {
+        std::lock_guard<std::mutex> lock(bookMutex);
+        return getImbalanceInternal();
+    }
+
+    Quote getBestQuote(Side side) const {
+        std::lock_guard<std::mutex> lock(bookMutex);
+        if (side == Side::Buy) {
+            if (Bids.empty()) return {0.0, 0};
+            int q = 0; for (auto& o : Bids.begin()->second) q += o.getQuantity();
+            return {Bids.begin()->first, q};
+        } else {
+            if (Asks.empty()) return {0.0, 0};
+            int q = 0; for (auto& o : Asks.begin()->second) q += o.getQuantity();
+            return {Asks.begin()->first, q};
+        }
+    }
+
+    // --- CORE LOGIC ---
+
+    void addOrder(const Order& order) {
+        std::lock_guard<std::mutex> lock(bookMutex);
+        addOrderInternal(order);
+    }
+
+    void runMarketMakerAlgo() {
+        std::lock_guard<std::mutex> lock(bookMutex);
+        
+        // Remove old algo quotes
+        cancelOrderInternal(999);
+        cancelOrderInternal(1000);
+
+        if (Bids.empty() || Asks.empty()) return;
+
+        double mid = (Bids.begin()->first + Asks.begin()->first) / 2.0;
+        double imbalance = getImbalanceInternal();
+        
+        // Fair Price calculation + Inventory Skew
+        double fairPrice = mid + ((imbalance - 0.5) * 0.40);
+        double skew = netInventory * 0.10;
+        
+        double bidPrice = (fairPrice - 0.5) - skew;
+        double askPrice = (fairPrice + 0.5) - skew;
+
+        if (netInventory < maxInventory) addOrderInternal(Order(999, OrderType::Limit, Side::Buy, bidPrice, 5));
+        if (netInventory > -maxInventory) addOrderInternal(Order(1000, OrderType::Limit, Side::Sell, askPrice, 5));
+    }
+
+private:
+    mutable std::mutex bookMutex;
+    std::map<double, std::list<Order>, std::less<double>> Asks;
+    std::map<double, std::list<Order>, std::greater<double>> Bids;
+    std::deque<Trade> tradeTape;
+    int netInventory = 0;
+    const int maxInventory = 100;
+
+    double getImbalanceInternal() const {
+        if (Bids.empty() || Asks.empty()) return 0.5;
+        int b = 0, a = 0;
+        for (auto& o : Bids.begin()->second) b += o.getQuantity();
+        for (auto& o : Asks.begin()->second) a += o.getQuantity();
+        return (double)b / (b + a);
+    }
+
+    void cancelOrderInternal(int id) {
+        auto remover = [id](std::map<double, std::list<Order>, auto>& map) {
+            for (auto it = map.begin(); it != map.end(); ) {
+                it->second.remove_if([id](const Order& o) { return o.getId() == id; });
+                if (it->second.empty()) it = map.erase(it);
+                else ++it;
+            }
+        };
+        remover(Bids); remover(Asks);
+    }
+
+    void addOrderInternal(const Order& order) {
+        Order remaining = matchAgainstOppositeInternal(order);
+        if (remaining.getQuantity() > 0 && remaining.getType() != OrderType::Market) {
+            if (remaining.getSide() == Side::Buy) Bids[remaining.getPrice()].push_back(remaining);
+            else Asks[remaining.getPrice()].push_back(remaining);
+        }
+    }
+
+    Order matchAgainstOppositeInternal(Order taker) {
+        if (taker.getSide() == Side::Buy) return performMatching(taker, Asks);
+        else return performMatching(taker, Bids);
+    }
+
+    template<typename T>
+    Order performMatching(Order taker, T& oppositeMap) {
+        while (!oppositeMap.empty() && taker.getQuantity() > 0) {
+            auto it = oppositeMap.begin();
+            bool match = (taker.getSide() == Side::Buy) ? (it->first <= taker.getPrice()) : (it->first >= taker.getPrice());
+            if (taker.getType() == OrderType::Market) match = true;
+
+            if (match) {
+                Order& maker = it->second.front();
+                int qty = std::min(taker.getQuantity(), maker.getQuantity());
+                
+                if (maker.getId() == 999 || maker.getId() == 1000) {
+                    if (maker.getSide() == Side::Buy) netInventory += qty;
+                    else netInventory -= qty;
+                }
+
+                taker.setQuantity(taker.getQuantity() - qty);
+                maker.setQuantity(maker.getQuantity() - qty);
+                if (maker.getQuantity() == 0) {
+                    it->second.pop_front();
+                    if (it->second.empty()) oppositeMap.erase(it);
+                }
+            } else break;
+        }
+        return taker;
+    }
+};
+
+// ==========================================
+// 2. THE BRAIN: OrderRouter (SOR)
+// ==========================================
+class OrderRouter {
+private:
+    std::unordered_map<std::string, std::unique_ptr<OrderBook>> marketCenters;
+
+public:
+    void addExchange(std::string name) {
+        marketCenters[name] = std::make_unique<OrderBook>();
+    }
+
+    OrderBook* getExchange(std::string name) {
+        return marketCenters[name].get();
+    }
+
+    void routeSmartOrder(int id, OrderBook::Side side, int qty, double limit) {
+        std::vector<std::pair<std::string, OrderBook::Quote>> options;
+        OrderBook::Side opposite = (side == OrderBook::Side::Buy) ? OrderBook::Side::Sell : OrderBook::Side::Buy;
+
+        for (auto& [name, book] : marketCenters) {
+            options.push_back({name, book->getBestQuote(opposite)});
+        }
+
+        std::sort(options.begin(), options.end(), [side](auto& a, auto& b) {
+            return (side == OrderBook::Side::Buy) ? (a.second.price < b.second.price) : (a.second.price > b.second.price);
+        });
+
+        int remaining = qty;
+        std::cout << "\n[SOR] Slicing " << qty << " units across venues..." << std::endl;
+        for (auto& opt : options) {
+            if (remaining <= 0 || opt.second.quantity == 0) break;
+            if (side == OrderBook::Side::Buy && opt.second.price > limit) continue;
+
+            int slice = std::min(remaining, opt.second.quantity);
+            marketCenters[opt.first]->addOrder(OrderBook::Order(id, OrderBook::OrderType::Limit, side, opt.second.price, slice));
+            remaining -= slice;
+            std::cout << "  > Routed " << slice << " to " << opt.first << " @ " << opt.second.price << std::endl;
+        }
+    }
+};
+
+// ==========================================
+// 3. runTests: Checking the Unit test
+// ==========================================
+
+void runTests() {
+    std::cout << "\n========== RUNNING UNIT TESTS ==========" << std::endl;
+
+    // TEST 1: Basic Matching (GTC/Limit)
+    {
+        OrderBook nse;
+        nse.addOrder(OrderBook::Order(1, OrderBook::OrderType::Limit, OrderBook::Side::Sell, 100.0, 10));
+        nse.addOrder(OrderBook::Order(2, OrderBook::OrderType::Limit, OrderBook::Side::Buy, 100.0, 10));
+        
+        if (nse.getMidPrice() == 0.0) {
+            std::cout << "[PASS] Test 1: Full match cleared the book." << std::endl;
+        } else {
+            std::cout << "[FAIL] Test 1: Orders remained on book." << std::endl;
+        }
+    }
+
+    // TEST 2: Fill-Or-Kill (FOK) Rejection
+    {
+        OrderBook bse;
+        bse.addOrder(OrderBook::Order(1, OrderBook::OrderType::Limit, OrderBook::Side::Sell, 100.0, 5));
+        
+        // Try to buy 10 FOK when only 5 are available
+        bse.addOrder(OrderBook::Order(2, OrderBook::OrderType::FOK, OrderBook::Side::Buy, 105.0, 10));
+        
+        auto quote = bse.getBestQuote(OrderBook::Side::Sell);
+        if (quote.quantity == 5) {
+            std::cout << "[PASS] Test 2: FOK rejected correctly (insufficient liquidity)." << std::endl;
+        } else {
+            std::cout << "[FAIL] Test 2: FOK partially filled or maker vanished." << std::endl;
+        }
+    }
+
+    // TEST 3: Smart Order Routing (SOR) Price Priority
+    {
+        OrderRouter router;
+        router.addExchange("CHEAP_EX");
+        router.addExchange("EXPENSIVE_EX");
+
+        router.getExchange("EXPENSIVE_EX")->addOrder(OrderBook::Order(1, OrderBook::OrderType::Limit, OrderBook::Side::Sell, 110.0, 100));
+        router.getExchange("CHEAP_EX")->addOrder(OrderBook::Order(2, OrderBook::OrderType::Limit, OrderBook::Side::Sell, 100.0, 5));
+
+        // Router should take the 5 units from CHEAP_EX first
+        router.routeSmartOrder(3, OrderBook::Side::Buy, 5, 115.0);
+
+        auto cheapQuote = router.getExchange("CHEAP_EX")->getBestQuote(OrderBook::Side::Sell);
+        if (cheapQuote.quantity == 0) {
+            std::cout << "[PASS] Test 3: Router prioritized cheaper exchange." << std::endl;
+        } else {
+            std::cout << "[FAIL] Test 3: Router did not clear cheap liquidity." << std::endl;
+        }
+    }
+
+    // TEST 4: Market Making Imbalance Skew
+    {
+        OrderBook mmBook;
+        // Heavy Sell side imbalance
+        mmBook.addOrder(OrderBook::Order(1, OrderBook::OrderType::Limit, OrderBook::Side::Sell, 100.0, 100));
+        mmBook.addOrder(OrderBook::Order(2, OrderBook::OrderType::Limit, OrderBook::Side::Buy, 99.0, 10));
+        
+        mmBook.runMarketMakerAlgo();
+        double mid = mmBook.getMidPrice();
+        
+        // With low imbalance (heavy sell pressure), MM should lower prices
+        if (mid < 99.5) {
+            std::cout << "[PASS] Test 4: Market Maker skewed prices based on imbalance." << std::endl;
+        } else {
+            std::cout << "[FAIL] Test 4: MM did not react to imbalance." << std::endl;
+        }
+    }
+
+    std::cout << "========================================\n" << std::endl;
+}
+
+// ==========================================
+// 4. MAIN: Orchestration
+// ==========================================
+
+int main() {
+    // OrderRouter sor;
+    // sor.addExchange("NSE");
+    // sor.addExchange("BSE");
+
+    // // 1. Manually seed some liquidity
+    // sor.getExchange("NSE")->addOrder(OrderBook::Order(1, OrderBook::OrderType::Limit, OrderBook::Side::Sell, 100.50, 10));
+    // sor.getExchange("BSE")->addOrder(OrderBook::Order(2, OrderBook::OrderType::Limit, OrderBook::Side::Sell, 100.20, 5));
+
+    // // 2. Run Market Maker on NSE to stabilize it
+    // sor.getExchange("NSE")->runMarketMakerAlgo();
+
+    // // 3. User sends a Smart Order
+    // sor.routeSmartOrder(1001, OrderBook::Side::Buy, 12, 101.00);
+    
+    runTests();
+
+    return 0;
+}
